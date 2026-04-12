@@ -1,0 +1,203 @@
+# -------------------------------
+# Common Airflow configuration block
+# -------------------------------
+x-airflow-common:
+  &airflow-common
+  image: apache/airflow:2.8.1                       # Airflow base Docker image version 2.8.1
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor          # Use LocalExecutor to run tasks in parallel locally
+    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow  # Connection string to Postgres metadata DB
+    AIRFLOW__CORE__FERNET_KEY: ''                   # Encryption key (empty = auto-generated at runtime)
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'  # New DAGs start paused by default
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'           # Disable default example DAGs
+    AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: 10  # Scheduler scans DAG files every 10s
+    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:- confluent-kafka yfinance pandas boto3 snowflake-connector-python minio}
+      # Installs extra Python libraries when container starts (Kafka, Pandas, Snowflake connector, MinIO client, etc.)
+  volumes:
+    - ./src/airflow/dags:/opt/airflow/dags          # Mount local DAG folder into Airflow DAG directory
+    - ./src/airflow/logs:/opt/airflow/logs          # Mount local logs directory for persistent log storage
+    - ./src/airflow/plugins:/opt/airflow/plugins    # Mount custom Airflow plugins
+    - ./src/airflow/requirements:/opt/airflow/requirements  # Custom requirements folder (optional)
+    - ./src/airflow/reports:/opt/airflow/reports    # Mount for any generated reports
+    - /var/run/docker.sock:/var/run/docker.sock     # Allows Airflow to run DockerOperator and manage containers
+  depends_on:
+    postgres:
+      condition: service_healthy                    # Airflow starts only after Postgres health check passes
+
+# -------------------------------
+# Define all Docker services
+# -------------------------------
+services:
+  postgres:
+    image: postgres:13                              # PostgreSQL 13 image for Airflow metadata storage
+    environment:
+      POSTGRES_USER: airflow                        # Database username
+      POSTGRES_PASSWORD: airflow                    # Database password
+      POSTGRES_DB: airflow                          # Database name
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data # Persist Postgres data between restarts
+    ports:
+      - 5433:5432                                   # Expose Postgres to host machine on port 5433
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]  # Health check command for database readiness
+      interval: 5s                                  # Check every 5 seconds
+      retries: 5                                    # Retry 5 times before failing
+    restart: always                                 # Always restart the container if it stops
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0          # Zookeeper container from Confluent platform
+    hostname: zookeeper                             # Assign hostname inside Docker network
+    container_name: zookeeper                       # Explicit container name
+    ports:
+      - "2181:2181"                                 # Expose Zookeeper client port
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181                   # Port where clients connect
+      ZOOKEEPER_TICK_TIME: 2000                     # Basic Zookeeper timing unit (ms)
+    volumes:
+      - ./data/zookeeper/data:/var/lib/zookeeper/data  # Persist Zookeeper data
+      - ./data/zookeeper/log:/var/lib/zookeeper/log    # Persist Zookeeper logs
+    restart: always                                 # Restart on failure
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0              # Kafka broker container from Confluent
+    hostname: kafka                                 # Kafka hostname for internal networking
+    container_name: kafka                           # Set container name explicitly
+    depends_on:
+      - zookeeper                                   # Kafka depends on Zookeeper
+    ports:
+      - "9092:9092"                                 # Internal network listener
+      - "29092:29092"                               # External listener for host access
+    environment:
+      KAFKA_BROKER_ID: 1                            # Unique Kafka broker ID
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181       # Zookeeper connection string
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT  # Define listener protocols
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092  # Advertise internal and external addresses
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1     # Single-node replication
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0     # Start consuming immediately after consumer joins
+    volumes:
+      - ./data/kafka:/var/lib/kafka/data            # Persist Kafka logs and data
+    restart: always                                 # Restart if container exits
+
+  minio:
+    image: minio/minio:latest                       # Object storage server (S3-compatible)
+    container_name: minio                           # Container name
+    ports:
+      - "9000:9000"  # API port                     # Port for S3 API access
+      - "9001:9001"  # Console port                 # Port for web console
+    environment:
+      MINIO_ROOT_USER: minioadmin                   # Root access user
+      MINIO_ROOT_PASSWORD: minioadmin               # Root password
+    volumes:
+      - ./data/minio:/data                          # Persist MinIO data (buckets and objects)
+    command: server /data --console-address ":9001"  # Start MinIO with console on port 9001
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]  # Health check for MinIO
+      interval: 30s                                 # Health check frequency
+      timeout: 20s                                  # Max response wait time
+      retries: 3                                    # Retry 3 times before failing
+    restart: always                                 # Restart container automatically
+
+  # Initialize MinIO buckets and users
+  minio-mc:
+    image: minio/mc:latest                          # MinIO client (mc) container to configure MinIO
+    depends_on:
+      - minio                                       # Wait until MinIO server is up
+    entrypoint: >
+      /bin/sh -c "
+      sleep 10;
+      /usr/bin/mc config host add myminio http://minio:9000 minioadmin minioadmin;
+      /usr/bin/mc mb myminio/weather-data;
+      /usr/bin/mc policy set public myminio/weather-data;
+      exit 0;
+      "
+      # Adds MinIO host config, creates 'weather-data' bucket, and sets it public for access
+
+  # spark-master service configuration
+  spark-master:
+    image: apache/spark:3.5.1                       # Apache Spark master node image
+    environment:
+      - SPARK_MODE=master                           # Run Spark in master mode
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no         # Disable authentication for simplicity
+      - SPARK_RPC_ENCRYPTION_ENABLED=no             # Disable encryption (local testing)
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no   # Disable local disk encryption
+      - SPARK_SSL_ENABLED=no                        # Disable SSL
+    ports:
+      - "8080:8080"                                 # Spark master web UI
+      - "7077:7077"                                 # Spark master RPC port
+    volumes:
+      - ./src/spark/jobs:/opt/spark/jobs            # Mount Spark job scripts
+      - ./data/spark:/opt/spark/data                # Mount Spark data directory
+    command: >
+      bash -c "/opt/spark/sbin/start-master.sh && tail -f /opt/spark/logs/spark--org.apache.spark.deploy.master*.out"
+      # Start Spark master process and keep logs running in foreground for container stability
+    restart: always                                 # Restart on crash or failure
+
+  spark-worker:
+    image: apache/spark:3.5.1                       # Spark worker node image
+    environment:
+      - SPARK_MODE=worker                           # Set worker mode
+      - SPARK_MASTER_URL=spark://spark-master:7077  # Point to master URL
+      - SPARK_WORKER_MEMORY=2g                      # Allocate 2 GB RAM for this worker
+      - SPARK_WORKER_CORES=2                        # Use 2 CPU cores
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no         # Disable authentication
+      - SPARK_RPC_ENCRYPTION_ENABLED=no             # Disable encryption
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no   # Disable storage encryption
+      - SPARK_SSL_ENABLED=no                        # Disable SSL
+    depends_on:
+      - spark-master                                # Ensure master is up first
+    volumes:
+      - ./src/spark/jobs:/opt/spark/jobs            # Mount job folder
+      - ./data/spark:/opt/spark/data                # Mount shared data folder
+    command: >
+      bash -c "/opt/spark/sbin/start-worker.sh spark://spark-master:7077 && tail -f /opt/spark/logs/spark--org.apache.spark.deploy.worker*.out"
+      # Start worker process and stream logs
+    restart: always                                 # Restart automatically if stopped
+  
+  spark-client:
+    image: apache/spark:3.5.1                       # Spark client image for submitting jobs
+    user: root                                      # Run as root to ensure permissions
+    depends_on:
+      - spark-master                                # Wait until master is ready
+    environment:
+      - SPARK_MODE=client                           # Client mode used for submitting Spark jobs
+      - SPARK_MASTER_URL=spark://spark-master:7077  # Connect client to Spark master
+    volumes:
+      - ./src/spark/jobs:/opt/spark/jobs            # Mount jobs directory
+      - ./src/airflow/dags/scripts:/opt/airflow/dags/scripts  # Allow Airflow to access Spark job scripts
+      - ./data:/opt/spark/data                      # Shared data directory for input/output
+      - ./data/ivy2:/home/spark/.ivy2               # Ivy cache to speed up package downloads
+    command: sleep infinity                         # Keep client running (useful for exec access)
+
+  airflow-webserver:
+    <<: *airflow-common                             # Inherit settings from x-airflow-common
+    command: webserver                              # Run Airflow webserver process
+    ports:
+      - 8081:8080                                   # Map Airflow UI to host port 8081
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]  # Check health endpoint
+      interval: 10s                                 # Run health check every 10 seconds
+      timeout: 10s                                  # Fail if not responsive within 10s
+      retries: 5                                    # Retry 5 times before marking unhealthy
+    restart: always                                 # Always restart webserver if it stops
+
+  airflow-scheduler:
+    <<: *airflow-common                             # Inherit common Airflow setup
+    command: scheduler                              # Start the scheduler process
+    restart: always                                 # Auto-restart on failure
+
+  airflow-init:
+    <<: *airflow-common                             # Use same base image/config
+    command: version                                # Run version check (initialization step)
+    environment:
+      <<: *airflow-common-env                       # Reuse environment variables from common block
+      _AIRFLOW_DB_UPGRADE: 'true'                   # Upgrade database schema on initialization
+      _AIRFLOW_WWW_USER_CREATE: 'true'              # Create default admin user
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}  # Admin username
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}  # Admin password
+
+# -------------------------------
+# Volumes declaration
+# -------------------------------
+volumes:
+  postgres-db-volume:                               # Named volume to persist Postgres data
