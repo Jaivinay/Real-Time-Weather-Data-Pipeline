@@ -1,5 +1,4 @@
 # 🌦️ Real-Time Weather Data Pipeline  
-**Big Data Final Project – ISM 6562**
 
 ---
 
